@@ -1,12 +1,19 @@
 """TUI画面群。Crystal版 cmd/main.cr のメニュー/board/thread/pagerループ(主線)に対応。
 
-キュー管理・履歴管理画面(menus.cr相当)は後回し。selector.cr/pager.cr/terminal.cr
-が担っていた「生ターミナル制御・自前セレクタ・自前ページャー」は、ここでは全て
-Textual標準のScreen/ListView/スクロールコンテナに置き換えている。
+selector.cr/pager.cr/terminal.cr が担っていた「生ターミナル制御・自前セレクタ・
+自前ページャー」は、ここでは全てTextual標準のScreen/ListView/スクロール
+コンテナに置き換えている。ただし selector.cr の核心的な操作体系である
+「番号入力→Enterで確定」(IndexedListViewMixin)だけは、Crystal版との操作感の
+齟齬を避けるため明示的に踏襲している。Crystal版は0始まりのインデックスを
+そのまま表示・入力に使う(`[start_idx + i]`表示、`input_buffer.to_i?`を
+そのまま配列添字に使用)ため、ここでも0始まりで揃えている。
+Textualの矢印キーによるハイライト移動+Enterとも併用でき、数字未入力なら
+ハイライト中の行が対象になる。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
@@ -18,6 +25,111 @@ from ..export_file import perform_export
 from ..models import Board, Category, Post, ThreadInfo
 from ..transfer import Task
 from ..webhook import broadcast_post, broadcast_posts, load_webhook_urls
+
+
+class IndexedListViewMixin:
+    """`ListView`を持つScreenに「数字入力→Enter/コマンドキーで確定」を付与するmixin。
+
+    サブクラス側の責務:
+      - compose()で `Label("", id="index-status")` を配置する(入力中の番号を表示)
+      - `_index_list_view_id()` : 対象ListViewのCSSセレクタ("#thread-list"等)
+      - `_index_item_count()`   : 現在の行数(範囲チェック用)
+      - `_activate(idx)`        : 数字未入力時のEnter(ハイライト選択)、および
+        数字入力+Enterの両方で呼ばれる「確定」処理(idxはNoneの場合がある)
+      - (任意)`_indexed_command_keys`と`_run_indexed_command(key, idx)`:
+        「番号+特定キー」でハイライトによらず指定インデックスに対して
+        コマンドを実行したい画面だけオーバーライドする(デフォルトは空集合=
+        番号ジャンプ機能のみ)。数字未入力でこれらのキーが押された場合は
+        on_keyでは処理せず、通常のBINDING解決(action_*、ハイライト対象)に委ねる。
+    """
+
+    _indexed_command_keys: ClassVar[set[str]] = set()
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._index_buffer: str = ""
+
+    # --- サブクラスが実装するフック ---
+
+    def _index_list_view_id(self) -> str:
+        raise NotImplementedError
+
+    def _index_item_count(self) -> int:
+        raise NotImplementedError
+
+    def _activate(self, idx: int | None) -> None:
+        raise NotImplementedError
+
+    def _run_indexed_command(self, key: str, idx: int) -> None:
+        """番号+コマンドキーの挙動。デフォルトは何もしない(ジャンプ専用画面向け)。"""
+
+    # --- 共通ロジック ---
+
+    def _update_index_status(self) -> None:
+        try:
+            label = self.query_one("#index-status", Label)
+        except Exception:
+            return
+        label.update(f"> {self._index_buffer}" if self._index_buffer else "")
+
+    def _clear_index_buffer(self) -> None:
+        self._index_buffer = ""
+        self._update_index_status()
+
+    def _resolved_index(self) -> int | None:
+        if not self._index_buffer:
+            return None
+        try:
+            idx = int(self._index_buffer)
+        except ValueError:
+            return None
+        return idx if 0 <= idx < self._index_item_count() else None
+
+    def on_key(self, event) -> None:
+        key = event.key
+
+        if len(key) == 1 and key.isdigit():
+            self._index_buffer += key
+            self._update_index_status()
+            event.stop()
+            return
+
+        if not self._index_buffer:
+            return  # バッファなし: 通常のBINDING解決(矢印ハイライト/Enter等)に委ねる
+
+        if key == "escape":
+            # バッファは破棄しつつ、戻る動作自体は通常のBINDING解決に任せる。
+            self._clear_index_buffer()
+            return
+
+        if key == "backspace":
+            self._index_buffer = self._index_buffer[:-1]
+            self._update_index_status()
+            event.stop()
+            return
+
+        if key == "enter":
+            idx = self._resolved_index()
+            self._clear_index_buffer()
+            event.stop()
+            if idx is None:
+                self.notify("無効なインデックスです", severity="warning")
+            else:
+                self._activate(idx)
+            return
+
+        if key in self._indexed_command_keys:
+            idx = self._resolved_index()
+            self._clear_index_buffer()
+            event.stop()
+            if idx is None:
+                self.notify("無効なインデックスです", severity="warning")
+            else:
+                self._run_indexed_command(key, idx)
+            return
+
+        # 未対応キー: バッファを破棄し、このキー自体は通常処理(BINDING解決)に委ねる。
+        self._clear_index_buffer()
 
 
 class SearchModal(ModalScreen[str | None]):
@@ -61,7 +173,7 @@ class _CategoryEntry:
     category: Category
 
 
-class MainMenuScreen(Screen):
+class MainMenuScreen(IndexedListViewMixin, Screen):
     """メインメニュー: ★最近読んだスレッド + カテゴリ一覧。"""
 
     BINDINGS = [
@@ -72,9 +184,16 @@ class MainMenuScreen(Screen):
         ("q", "quit", "終了"),
     ]
 
+    def _index_list_view_id(self) -> str:
+        return "#menu-list"
+
+    def _index_item_count(self) -> int:
+        return len(self._entries)
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield ListView(id="menu-list")
+        yield Label("", id="index-status")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -92,19 +211,28 @@ class MainMenuScreen(Screen):
 
         await list_view.clear()
 
+        width = len(str(len(recent[:15]) + len(categories) - 1)) if (recent or categories) else 1
+        width = max(width, 1)
+
         for rt in recent[:15]:
+            i = len(self._entries)
             self._entries.append(_RecentEntry(thread=rt.thread_info))
-            list_view.append(ListItem(Label(f"★ {rt.thread_info.title}"), classes="recent"))
+            list_view.append(
+                ListItem(Label(f"{i:>{width}} ★ {rt.thread_info.title}"), classes="recent")
+            )
 
         for cat in categories:
+            i = len(self._entries)
             self._entries.append(_CategoryEntry(category=cat))
-            list_view.append(ListItem(Label(cat.title)))
+            list_view.append(ListItem(Label(f"{i:>{width}} {cat.title}")))
 
         if self._entries:
             list_view.index = 0
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        idx = event.list_view.index
+        self._activate(event.list_view.index)
+
+    def _activate(self, idx: int | None) -> None:
         if idx is None or idx >= len(self._entries):
             return
         entry = self._entries[idx]
@@ -145,7 +273,7 @@ class MainMenuScreen(Screen):
         self.app.exit()
 
 
-class BoardListScreen(Screen):
+class BoardListScreen(IndexedListViewMixin, Screen):
     """カテゴリ内の板一覧。"""
 
     BINDINGS = [("b", "back", "戻る"), ("escape", "back", "戻る")]
@@ -154,22 +282,32 @@ class BoardListScreen(Screen):
         super().__init__()
         self._category = category
 
+    def _index_list_view_id(self) -> str:
+        return "#board-list"
+
+    def _index_item_count(self) -> int:
+        return len(self._category.boards)
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield ListView(id="board-list")
+        yield Label("", id="index-status")
         yield Footer()
 
     async def on_mount(self) -> None:
         list_view = self.query_one("#board-list", ListView)
-        for board in self._category.boards:
+        width = max(len(str(max(len(self._category.boards) - 1, 0))), 1)
+        for i, board in enumerate(self._category.boards):
             has_history = await self.app.history.has_history_in_board(board.url)
-            label = f"{'✔ ' if has_history else '  '}{board.title}"
-            list_view.append(ListItem(Label(label)))
+            mark = "✔ " if has_history else "  "
+            list_view.append(ListItem(Label(f"{i:>{width}} {mark}{board.title}")))
         if self._category.boards:
             list_view.index = 0
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        idx = event.list_view.index
+        self._activate(event.list_view.index)
+
+    def _activate(self, idx: int | None) -> None:
         if idx is None or idx >= len(self._category.boards):
             return
         board = self._category.boards[idx]
@@ -179,8 +317,15 @@ class BoardListScreen(Screen):
         self.app.pop_screen()
 
 
-class ThreadListScreen(Screen):
-    """板内スレ一覧、または検索結果一覧。"""
+class ThreadListScreen(IndexedListViewMixin, Screen):
+    """板内スレ一覧、または検索結果一覧。
+
+    番号入力+Enterでのジャンプ(Pagerを開く)に加え、番号入力+w/e/E/m/Hで
+    「ハイライト行ではなく指定インデックスのスレッド」に対してコマンドを
+    実行できる。番号未入力時はハイライト行が対象になる。
+    """
+
+    _indexed_command_keys: ClassVar[set[str]] = {"w", "e", "E", "m", "H"}
 
     BINDINGS = [
         ("b", "back", "戻る"),
@@ -205,10 +350,30 @@ class ThreadListScreen(Screen):
         self._title = title or (board.title if board else "スレッド一覧")
         self._queued: set[tuple[str, str]] = set()
 
+    def _index_list_view_id(self) -> str:
+        return "#thread-list"
+
+    def _index_item_count(self) -> int:
+        return len(self._threads)
+
+    def _run_indexed_command(self, key: str, idx: int) -> None:
+        t = self._threads[idx]
+        if key == "w":
+            self.run_worker(self._do_webhook_send(t), exclusive=True)
+        elif key == "e":
+            self._do_export(t, as_markdown=True)
+        elif key == "E":
+            self._do_export(t, as_markdown=False)
+        elif key == "m":
+            self._do_enqueue(t)
+        elif key == "H":
+            self._do_delete_history(t)
+
     def compose(self) -> ComposeResult:
         yield Header()
         yield Label(self._title, id="thread-list-title")
         yield ListView(id="thread-list")
+        yield Label("", id="index-status")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -234,16 +399,21 @@ class ThreadListScreen(Screen):
     async def _refresh_list(self) -> None:
         list_view = self.query_one("#thread-list", ListView)
         await list_view.clear()
-        for t in self._threads:
+        width = max(len(str(max(len(self._threads) - 1, 0))), 1)
+        for i, t in enumerate(self._threads):
             mark = "+" if t.has_new else ("✔" if t.last_read > 0 else " ")
             queued_mark = "📨" if (t.board_url, t.dat_file) in self._queued else " "
             info = f"({t.count}/{int(t.ikioi)})" if t.ikioi > 0 else f"({t.count})"
-            list_view.append(ListItem(Label(f"{mark}{queued_mark} {info} {t.title}")))
+            list_view.append(
+                ListItem(Label(f"{i:>{width}} {mark}{queued_mark} {info} {t.title}"))
+            )
         if self._threads:
             list_view.index = 0
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        idx = event.list_view.index
+        self._activate(event.list_view.index)
+
+    def _activate(self, idx: int | None) -> None:
         if idx is None or idx >= len(self._threads):
             return
         self.app.push_screen(ThreadPagerScreen(self._threads[idx]))
@@ -252,15 +422,19 @@ class ThreadListScreen(Screen):
         if self._board is not None:
             await self._load(force_reload=True)
 
-    def action_webhook_send(self) -> None:
-        self.run_worker(self._do_webhook_send(), exclusive=True)
-
-    async def _do_webhook_send(self) -> None:
+    def _highlighted_thread(self) -> ThreadInfo | None:
         list_view = self.query_one("#thread-list", ListView)
         idx = list_view.index
         if idx is None or idx >= len(self._threads):
+            return None
+        return self._threads[idx]
+
+    def action_webhook_send(self) -> None:
+        self.run_worker(self._do_webhook_send(self._highlighted_thread()), exclusive=True)
+
+    async def _do_webhook_send(self, t: ThreadInfo | None) -> None:
+        if t is None:
             return
-        t = self._threads[idx]
 
         urls = load_webhook_urls(self.app.config.webhook_urls_file)
         if not urls:
@@ -290,21 +464,13 @@ class ThreadListScreen(Screen):
     def action_back(self) -> None:
         self.app.pop_screen()
 
-    def _highlighted_thread(self) -> ThreadInfo | None:
-        list_view = self.query_one("#thread-list", ListView)
-        idx = list_view.index
-        if idx is None or idx >= len(self._threads):
-            return None
-        return self._threads[idx]
-
     def action_export_markdown(self) -> None:
-        self._do_export(as_markdown=True)
+        self._do_export(self._highlighted_thread(), as_markdown=True)
 
     def action_export_json(self) -> None:
-        self._do_export(as_markdown=False)
+        self._do_export(self._highlighted_thread(), as_markdown=False)
 
-    def _do_export(self, as_markdown: bool) -> None:
-        t = self._highlighted_thread()
+    def _do_export(self, t: ThreadInfo | None, as_markdown: bool) -> None:
         if t is None:
             return
         self.run_worker(self._export_worker(t, as_markdown), exclusive=True)
@@ -316,7 +482,9 @@ class ThreadListScreen(Screen):
         self.notify(message, severity=severity)
 
     def action_enqueue(self) -> None:
-        t = self._highlighted_thread()
+        self._do_enqueue(self._highlighted_thread())
+
+    def _do_enqueue(self, t: ThreadInfo | None) -> None:
         if t is None:
             return
         if not self.app.discord.enabled():
@@ -335,7 +503,9 @@ class ThreadListScreen(Screen):
         await self._refresh_list()
 
     def action_delete_history(self) -> None:
-        t = self._highlighted_thread()
+        self._do_delete_history(self._highlighted_thread())
+
+    def _do_delete_history(self, t: ThreadInfo | None) -> None:
         if t is None:
             return
         self.run_worker(self._delete_history_worker(t), exclusive=True)
@@ -357,6 +527,8 @@ class ThreadPagerScreen(Screen):
 
     Crystal版 pager.cr の「現在ビューポート下端が指すレス番号」追跡を、
     Textualのスクロールイベントで簡易的に再現している。
+    ページャーは単一スレッドの本文表示であり、選択対象となる「複数項目のリスト」を
+    持たないため、IndexedListViewMixin(番号入力)は適用しない。
     """
 
     BINDINGS = [
@@ -498,7 +670,7 @@ class ThreadPagerScreen(Screen):
             self.notify(f"送信しました: {post.num}")
 
 
-class QueueManageScreen(Screen):
+class QueueManageScreen(IndexedListViewMixin, Screen):
     """転送待機列の一覧・削除。Crystal版 menus.cr manage_queue に対応。"""
 
     BINDINGS = [("b", "back", "戻る"), ("escape", "back", "戻る")]
@@ -507,10 +679,20 @@ class QueueManageScreen(Screen):
         super().__init__()
         self._tasks: list = []
 
+    def _index_list_view_id(self) -> str:
+        return "#queue-list"
+
+    def _index_item_count(self) -> int:
+        return len(self._tasks)
+
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Label("転送待機列の管理 (Enterで削除 / b:戻る)", id="queue-title")
+        yield Label(
+            "転送待機列の管理 (番号+Enter、またはハイライトしてEnterで削除 / b:戻る)",
+            id="queue-title",
+        )
         yield ListView(id="queue-list")
+        yield Label("", id="index-status")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -526,12 +708,15 @@ class QueueManageScreen(Screen):
             list_view.append(ListItem(Label("(待機中のタスクはありません)")))
             return
 
+        width = max(len(str(max(len(self._tasks) - 1, 0))), 1)
         for i, task in enumerate(self._tasks):
-            list_view.append(ListItem(Label(f"[{i}] {task.title}")))
+            list_view.append(ListItem(Label(f"{i:>{width}} {task.title}")))
         list_view.index = 0
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        idx = event.list_view.index
+        self._activate(event.list_view.index)
+
+    def _activate(self, idx: int | None) -> None:
         if idx is None or idx >= len(self._tasks):
             return
         self.run_worker(self._do_delete(idx), exclusive=True)
@@ -546,7 +731,7 @@ class QueueManageScreen(Screen):
         self.app.pop_screen()
 
 
-class HistoryManageScreen(Screen):
+class HistoryManageScreen(IndexedListViewMixin, Screen):
     """閲覧履歴の一覧・削除。Crystal版 menus.cr manage_history に対応。"""
 
     BINDINGS = [("b", "back", "戻る"), ("escape", "back", "戻る")]
@@ -555,10 +740,20 @@ class HistoryManageScreen(Screen):
         super().__init__()
         self._items: list = []
 
+    def _index_list_view_id(self) -> str:
+        return "#history-list"
+
+    def _index_item_count(self) -> int:
+        return len(self._items)
+
     def compose(self) -> ComposeResult:
         yield Header()
-        yield Label("閲覧履歴の管理 (Enterで削除 / b:戻る)", id="history-title")
+        yield Label(
+            "閲覧履歴の管理 (番号+Enter、またはハイライトしてEnterで削除 / b:戻る)",
+            id="history-title",
+        )
         yield ListView(id="history-list")
+        yield Label("", id="index-status")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -574,13 +769,18 @@ class HistoryManageScreen(Screen):
             list_view.append(ListItem(Label("(履歴はありません)")))
             return
 
+        width = max(len(str(max(len(self._items) - 1, 0))), 1)
         for i, item in enumerate(self._items):
             t = item.thread_info
-            list_view.append(ListItem(Label(f"[{i}] {t.title} (Read: {t.last_read})")))
+            list_view.append(
+                ListItem(Label(f"{i:>{width}} {t.title} (Read: {t.last_read})"))
+            )
         list_view.index = 0
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        idx = event.list_view.index
+        self._activate(event.list_view.index)
+
+    def _activate(self, idx: int | None) -> None:
         if idx is None or idx >= len(self._items):
             return
         self.run_worker(self._do_delete(idx), exclusive=True)
