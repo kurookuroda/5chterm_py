@@ -9,12 +9,15 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 
 from ..browser import Browser
 from ..config import load_config
 from ..errors import BrowserError, NetworkFetchError, ThreadGoneError
 from ..history import Manager, NullHistory
-from ..models import ThreadInfo
+from ..models import Post, ThreadInfo
+from ..webhook import broadcast_posts, load_webhook_urls
 
 
 def _classify_error_type(ex: Exception) -> str:
@@ -163,32 +166,118 @@ async def run_export_command(args: list[str]) -> int:
     return 0
 
 
-async def run_export_batch_command(args: list[str]) -> int:
-    """`x5ch export-batch [history_file]` — 履歴(history.json)を入力に、
-    各スレッドを since_num=履歴のres値 で差分エクスポートし、threads配列でまとめて出力する。
-    履歴ファイル省略時は設定のhistory_fileを使う。
-    """
-    cfg = load_config()
-    history_path = args[0] if args else cfg.history_file
+@dataclass
+class _BatchTarget:
+    board_url: str
+    dat_file: str
+    since_num: int = 0
 
-    hist = Manager(history_path)
+
+async def _load_targets_from_history(history_file: str, incremental: bool) -> list[_BatchTarget]:
+    hist = Manager(history_file)
     entries = await hist.all_entries()
+    return [
+        _BatchTarget(
+            board_url=e.board_url,
+            dat_file=e.dat_file,
+            since_num=e.res if incremental else 0,
+        )
+        for e in entries
+    ]
+
+
+def _load_targets_from_queue(queue_file: str) -> list[_BatchTarget]:
+    path = Path(queue_file)
+    if not path.exists():
+        return []
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as ex:
+        print(f"キューファイル読み込みエラー: {ex}", file=sys.stderr)
+        sys.exit(1)
+
+    targets: list[_BatchTarget] = []
+    for item in raw:
+        board_url = item.get("board_url")
+        dat_file = item.get("dat_file")
+        if not board_url or not dat_file:
+            continue
+        # export-batchの errors 配列をそのまま --input に渡すリトライ運用のため、
+        # since_num が含まれていればそれを差分取得に使う(通常のqueue.jsonには無いので0扱い)。
+        since_num = item.get("since_num") or 0
+        targets.append(_BatchTarget(board_url=board_url, dat_file=dat_file, since_num=since_num))
+    return targets
+
+
+async def run_export_batch_command(args: list[str]) -> int:
+    """`x5ch export-batch --source history|queue [--incremental] [--input <file>]`
+
+    --source history (デフォルト): 履歴(history.json)全体を対象にした網羅的・
+      継続的アーカイブ(cron想定)。--incrementalを付けた場合のみ、各スレッドの
+      履歴res値をsince_numとして差分取得する(未指定時は常にフル取得)。
+    --source queue: queue.json(またはdefault --input で指定した任意ファイル)を
+      対象にした選択的エクスポート。常にフル取得。
+
+    出力の errors 配列は、失敗したスレッドをそのままリトライ用の
+    --source queue --input <このファイル> の入力として再利用できる形
+    (board_url/dat_file/since_num)を保持している。
+    """
+    source = "history"
+    incremental = False
+    input_path: str | None = None
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--source":
+            i += 1
+            if i < len(args):
+                source = args[i]
+        elif arg.startswith("--source="):
+            source = arg.split("=", 1)[1]
+        elif arg == "--incremental":
+            incremental = True
+        elif arg == "--input":
+            i += 1
+            if i < len(args):
+                input_path = args[i]
+        elif arg.startswith("--input="):
+            input_path = arg.split("=", 1)[1]
+        i += 1
+
+    cfg = load_config()
+
+    if source == "history":
+        targets = await _load_targets_from_history(input_path or cfg.history_file, incremental)
+    elif source == "queue":
+        targets = _load_targets_from_queue(input_path or cfg.queue_file)
+    else:
+        print(f"不明な--source: {source} (historyまたはqueueを指定)", file=sys.stderr)
+        return 1
+
+    if not targets:
+        print("対象のスレッドがありません", file=sys.stderr)
+        return 1
 
     browser = Browser(cfg.user_agent, NullHistory(), cfg.cache_expiration)
 
     threads: list[dict] = []
     errors: list[dict] = []
+    total = len(targets)
 
-    for entry in entries:
+    for idx, t in enumerate(targets, start=1):
+        print(f"[{idx}/{total}] 取得中: {t.board_url} {t.dat_file}", file=sys.stderr)
         try:
             result = await browser.export_thread_data(
-                entry.board_url, entry.dat_file, since_num=entry.res
+                t.board_url, t.dat_file, since_num=t.since_num
             )
         except Exception as ex:
             errors.append(
                 {
-                    "board_url": entry.board_url,
-                    "dat_file": entry.dat_file,
+                    "board_url": t.board_url,
+                    "dat_file": t.dat_file,
+                    "since_num": t.since_num,
                     "error": str(ex),
                     "error_type": _classify_error_type(ex),
                     "error_url": _extract_error_url(ex),
@@ -199,6 +288,110 @@ async def run_export_batch_command(args: list[str]) -> int:
 
     _write_envelope({"ok": True, "threads": threads, "errors": errors})
     return 0
+
+
+async def run_webhook_send_command(args: list[str]) -> int:
+    """`x5ch webhook-send <json_file|-> [--webhook-url URL ...]`
+
+    `export`/`export-batch`が出力したJSON(単一ExportResult、または
+    {ok,threads,errors}形式のどちらも可)を読み込み、各スレッドのposts配列を
+    1件ずつ、指定した(または設定ファイルの)全webhook URLへブロードキャストする。
+    """
+    urls_override: list[str] = []
+    positional: list[str] = []
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == "--webhook-url":
+            i += 1
+            if i < len(args):
+                urls_override.append(args[i])
+        elif arg.startswith("--webhook-url="):
+            urls_override.append(arg.split("=", 1)[1])
+        else:
+            positional.append(arg)
+        i += 1
+
+    if not positional:
+        print("使い方: x5ch webhook-send <json_file|-> [--webhook-url URL ...]", file=sys.stderr)
+        print("例:     x5ch export ... | x5ch webhook-send -", file=sys.stderr)
+        return 1
+
+    json_path = positional[0]
+
+    if json_path == "-":
+        raw = sys.stdin.read()
+    else:
+        try:
+            raw = Path(json_path).read_text(encoding="utf-8")
+        except OSError as ex:
+            print(f"ファイル読み込みエラー: {ex}", file=sys.stderr)
+            return 1
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as ex:
+        print(f"JSON解析エラー: {ex}", file=sys.stderr)
+        return 1
+
+    cfg = load_config()
+    urls = urls_override or load_webhook_urls(cfg.webhook_urls_file)
+    if not urls:
+        print("webhook URLが指定/設定されていません", file=sys.stderr)
+        print(
+            f"--webhook-url で指定するか、{cfg.webhook_urls_file} を用意してください",
+            file=sys.stderr,
+        )
+        return 1
+
+    if isinstance(data, dict) and "threads" in data:
+        thread_entries = data.get("threads") or []
+    elif isinstance(data, dict) and "posts" in data:
+        thread_entries = [data]
+    else:
+        print(
+            "未対応のJSON形式です(export/export-batchが出力したJSONを指定してください)",
+            file=sys.stderr,
+        )
+        return 1
+
+    total_sent = 0
+    all_failures: dict[str, list[str]] = {}
+
+    for entry in thread_entries:
+        posts_raw = entry.get("posts") or []
+        if not posts_raw:
+            continue
+
+        thread_title = (entry.get("thread") or {}).get("title", "")
+        posts = [
+            Post(
+                num=p.get("num", 0),
+                name=p.get("author_name_display") or "名無し",
+                date=p.get("posted_at") or p.get("posted_at_raw") or "",
+                message=p.get("body_display") or p.get("body_raw") or "",
+            )
+            for p in posts_raw
+        ]
+
+        failures = await broadcast_posts(urls, posts)
+        total_sent += len(posts)
+        for url, failed_nums in failures.items():
+            if failed_nums:
+                all_failures.setdefault(url, []).extend(
+                    f"{thread_title}#{n}" for n in failed_nums
+                )
+
+    _write_envelope(
+        {
+            "ok": not all_failures,
+            "sent_threads": len(thread_entries),
+            "sent_posts": total_sent,
+            "failures": all_failures,
+        }
+    )
+    return 0 if not all_failures else 1
 
 
 def main() -> None:
@@ -215,6 +408,7 @@ def main() -> None:
         "read": run_read_command,
         "export": run_export_command,
         "export-batch": run_export_batch_command,
+        "webhook-send": run_webhook_send_command,
     }
     handler = handlers.get(command)
     if handler is None:

@@ -32,7 +32,6 @@ Python(このリポジトリ)。
 
 未実装(次フェーズ):
 
-- 非対話の`webhook-send <json_file>`サブコマンド(TUI版は実装済み)
 - ヘルプ画面(`render.cr`のキー一覧表示相当)
 
 ## 対話TUI(フェーズ7・主線のみ)
@@ -88,8 +87,23 @@ TUIでのキー(いずれも送信内容フォーマットはBot版と同じ「�
 - **スレ一覧画面**: `w` — 選択中スレッドの未読分(history基準)を送信
 - **Pager画面**: `w` — 表示中スレッドの未読分を送信 / `W` — 現在のスクロール位置の1件のみ送信
 
-非対話の`webhook-send <json_file>`サブコマンド(export/export-batchの出力を
-そのまま流し込む版)は未実装。
+非対話コマンド`webhook-send`は`export`/`export-batch`が出力したJSON
+(単一ExportResult、または`{ok,threads,errors}`形式のどちらも可)を読み込み、
+各スレッドの`posts`を1件ずつ全URLへブロードキャストする:
+
+```bash
+# ファイル指定
+python -m x5ch.cli.main webhook-send export.json --webhook-url https://discord.com/api/webhooks/AAA
+
+# パイプ(標準入力は "-")、複数URLへ同時ブロードキャスト
+python -m x5ch.cli.main export https://mao.5ch.io/linux/ 1765829109.dat \
+  | python -m x5ch.cli.main webhook-send - \
+      --webhook-url https://discord.com/api/webhooks/AAA \
+      --webhook-url https://discord.com/api/webhooks/BBB
+
+# --webhook-url省略時はwebhook_urls_file(設定ファイル)を使う
+python -m x5ch.cli.main webhook-send export-batch-output.json
+```
 
 ## CLIコマンド
 
@@ -103,19 +117,40 @@ python -m x5ch.cli.main read <board_url> <dat_file>
 # 単一スレッドをアーカイブ用JSONでエクスポート(BBSインポート用)
 python -m x5ch.cli.main export <board_url> <dat_file> [--since-num N]
 
-# history.json全体を対象に、各スレッドをres値からの差分でまとめてエクスポート
-python -m x5ch.cli.main export-batch [history_file]
-# history_file省略時は $X5CH_HISTORY_FILE (デフォルト ~/.x5ch_history.json)
+# history.json全体を対象に一括エクスポート(デフォルトはフル取得)
+python -m x5ch.cli.main export-batch --source history
+# --incrementalを付けると、各スレッドの履歴res値からの差分のみ取得
+python -m x5ch.cli.main export-batch --source history --incremental
+
+# queue.json(Discord転送待機列)を対象に選択的エクスポート(常にフル取得)
+python -m x5ch.cli.main export-batch --source queue
+# --inputで任意のファイルを指定可能(下記のリトライ運用にも使う)
+python -m x5ch.cli.main export-batch --source queue --input /path/to/file.json
+
+# export/export-batchの出力をwebhookへ送信(詳細は「Webhook送信」の節を参照)
+python -m x5ch.cli.main webhook-send <json_file|-> [--webhook-url URL ...]
 ```
 
-`export-batch`の出力形式:
+`export-batch`の出力形式(`errors`の各要素は`--source queue --input`に
+そのまま渡せるリトライ用の形を保っている。`since_num`も保持しているため、
+`--incremental`実行時の失敗も差分位置を失わずに再試行できる):
 
 ```json
 {
   "ok": true,
   "threads": [ { "source": {...}, "thread": {...}, "posts": [...] } ],
-  "errors": [ { "board_url": "...", "dat_file": "...", "error": "...", "error_type": "..." } ]
+  "errors": [
+    { "board_url": "...", "dat_file": "...", "since_num": 342, "error": "...", "error_type": "..." }
+  ]
 }
+```
+
+リトライの流れ:
+
+```bash
+x5ch export-batch --source history --incremental > result.json
+python -c "import json; json.dump(json.load(open('result.json'))['errors'], open('retry.json','w'))"
+x5ch export-batch --source queue --input retry.json
 ```
 
 ## 注意
@@ -133,6 +168,13 @@ python -m x5ch.cli.main export-batch [history_file]
   一覧表示・削除・再採番)、スレ一覧の`e`/`E`(実ファイル書き出しを確認)・`m`
   (キュー追加+履歴登録)・`H`(実際に保存した履歴が正しく削除されること)を
   TUI経由で検証は行っていますが、実データ・実API・実ターミナルでの
-  最終確認をお願いします。
+  最終確認をお願いします。非対話`webhook-send`は、単一export形式/
+  export-batch形式(threads配列)双方の入力・ファイル/stdin("-")両対応・
+  複数`--webhook-url`指定・URL未設定時のエラー・未対応JSON形式のエラー、
+  をHTTP送信部分だけモック化して検証済みです。`export-batch`の
+  `--source history`(フル/`--incremental`差分)・`--source queue`
+  (デフォルト/`--input`指定)・対象なし・不明な`--source`の6シナリオ、
+  および`since_num`を保持した失敗エントリがリトライ入力として正しく
+  再利用できることも確認済みです。
 - `parse.py`/`export.py`のレス境界検出は `div[class*="clear post"]` を
   前提にしています。実際のHTML構造とズレがあれば調整が必要です。
