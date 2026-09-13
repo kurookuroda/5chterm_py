@@ -1,0 +1,3 @@
+httpx>=0.27
+selectolax>=0.3
+textual>=8.0
